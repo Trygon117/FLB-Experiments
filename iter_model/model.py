@@ -85,7 +85,7 @@ class Layer_Block(nn.Module):
         return lat + update
 
 class Iteration_Model(nn.Module):
-    def __init__(self, vocab_size, hidden_dim, max_seq_len=512, num_layers = 3, sweep_iters = 2, layer_iters = 5):
+    def __init__(self, vocab_size, hidden_dim, max_seq_len=512, sweeps = 1, sweep_iters = 1, num_layers = 6, layer_iters = 1):
         super(Iteration_Model, self).__init__()
         self.hidden_dim = hidden_dim
 
@@ -93,11 +93,14 @@ class Iteration_Model(nn.Module):
         self.pos_embedding = nn.Embedding(max_seq_len, hidden_dim)
 
         self.layers = nn.ModuleList([Layer_Block(hidden_dim) for _ in range(num_layers)])
+
+        self.final_norm = nn.LayerNorm(hidden_dim)
         self.output = nn.Linear(hidden_dim, vocab_size)
 
-        self.layer_iters = layer_iters
+        self.sweeps = sweeps
         self.sweep_iters = sweep_iters
         self.num_layers = num_layers
+        self.layer_iters = layer_iters
 
     def forward(self, x):
         batch_size, seq_len = x.shape
@@ -106,36 +109,43 @@ class Iteration_Model(nn.Module):
         positions = torch.arange(seq_len, device=x.device)
         embeddings = self.embedding(x) + self.pos_embedding(positions)
 
-        outputs = [torch.zeros_like(embeddings) for _ in range(self.num_layers)]
+        # A place to store the output of each layer for each sweep iteration
+        layers_out = [torch.zeros_like(embeddings) for _ in range(self.num_layers)]
 
-        # For each sweep iteration
-        for s in range(self.sweep_iters):
-            x = embeddings # Reset x to the base input for layer 0
-            # outputs = [out.detach() for out in outputs]
+        x_stream = embeddings
 
-            # For each layer
-            for n in range(self.num_layers):
-                layer_out = outputs[n]
+        for s in range(self.sweeps): # Go through each Sweep
+            for si in range(self.sweep_iters): # Go through each Sweep Iteration
+                for n in range(self.num_layers): # Go through each layer
 
-                # Handle the top layer having no backward connection
-                if n + 1 < self.num_layers:
-                    bck_input = outputs[n+1]#.detach()
-                else:
-                    bck_input = torch.zeros_like(layer_out)
+                    # Backward signal from the layer above
+                    if n + 1 < self.num_layers:
+                        back = layers_out[n+1]
+                    else: 
+                        back = torch.zeros_like(x_stream)
 
-                ####   # Settle the state across early iterations without tracking memory
-                ####   with torch.no_grad():
-                ####       for l in range(self.layer_iters - 1):
-                ####           layer_out = self.layers[n](x, layer_out, bck_input)
-                ####   
-                ####   # Track gradients only on the final iteration
-                ####   layer_out = self.layers[n](x, layer_out, bck_input)
+                    # Forward signal from the layer below or the base stream
+                    if(n == 0):
+                        forward = x_stream
+                    else:
+                        forward = forward + layers_out[n-1]
 
-                for l in range(self.layer_iters - 1):
-                    layer_out = self.layers[n](x, layer_out, bck_input)
+                    for l in range(self.layer_iters): # Go through every layer iteration
 
-                outputs[n] = layer_out
-                x = x + layer_out  # Update x to the output of the current layer after every layer iteration is finished
+                        # Pass in the current forward input, the iterated lateral input, and the current backward input
+                        layers_out[n] = self.layers[n](forward, layers_out[n], back)
+
+                    ### end layer iterations
+                ### end layers
+            ### end sweep iterations
+
+            # After every sweep update the input to the next sweep with the output of the last layer
+            x_stream = x_stream + layers_out[self.num_layers - 1]
+        ### end sweeps
         
-        output = self.output(x)
+        # Normalize and pass final output through prediction head
+        x_stream = self.final_norm(x_stream)
+        output = self.output(x_stream)
         return output
+
+    
