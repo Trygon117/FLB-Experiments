@@ -1,103 +1,74 @@
 import torch
 import torch.nn as nn
 
-class FLB_Attention(nn.Module):
-    def __init__(self, hidden_size, num_heads=4):
-        super(FLB_Attention, self).__init__()
-        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
-
-        self.hidden_dim = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-
-        self.W_q = nn.Linear(hidden_size, hidden_size)
-        self.W_k = nn.Linear(hidden_size, hidden_size)
-        self.W_v = nn.Linear(hidden_size, hidden_size)
-
-        self.softmax = nn.Softmax(dim=-1)
-        # self.out_proj = nn.Linear(hidden_size, hidden_size)
-    
-    def forward(self, fwd, lat, bck):
-        batch_size, seq_len, _ = fwd.shape
-
-        # Context merges all three streams
-        context = fwd + lat + bck
-
-        # Compute query, key, and value vectors
-        Q = self.W_q(context)
-        K = self.W_k(context)
-        V = self.W_v(context)
-
-        # Split the features into separate heads
-        Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # Compute raw dot product attention scores
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
-
-        # Mask future tokens so earlier positions cannot cheat during generation
-        mask = torch.triu(torch.ones(seq_len, seq_len, device=fwd.device), diagonal=1).bool()
-        scores = scores.masked_fill(mask, float('-inf'))
-
-        # Normalize scores and weight the values
-        attn_weights = self.softmax(scores)
-        context_out = torch.matmul(attn_weights, V)
-
-        # Swap dimensions back and flatten heads into the original hidden dimension
-        context_out = context_out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_dim)
-        # context_out = self.out_proj(context_out)
-
-        return context_out
-
 class Layer_Block(nn.Module):
-    def __init__(self, hidden_size, expansion=2, num_heads=4):
+    def __init__(self, hidden_dim, expansion=2, num_heads=4):
         super(Layer_Block, self).__init__()
 
-        self.F = nn.Linear(hidden_size, hidden_size)
-        self.L = nn.Linear(hidden_size, hidden_size)
-        self.B = nn.Linear(hidden_size, hidden_size)
+        # Each incoming token get a learnable identity projection and a normalization layer
+        self.F = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim))
+        self.L = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim))
+        self.B = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim))
 
-        nn.init.zeros_(self.B.weight)
-        nn.init.zeros_(self.B.bias)
+        # Mixes the 3 streams (F, L, B) at each position
+        self.stream_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, batch_first=True)
 
-        self.FLB_Attention = FLB_Attention(hidden_size, num_heads=num_heads)
+        # Mixes tokens across the sequence length
+        self.seq_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, batch_first=True)
 
-        self.norm_fwd = nn.LayerNorm(hidden_size)
-        self.norm_lat = nn.LayerNorm(hidden_size)
-        self.norm_bck = nn.LayerNorm(hidden_size)
-
-        self.norm_attn = nn.LayerNorm(hidden_size)
+        # Normalize the output after each attention operation
+        self.norm_stream = nn.LayerNorm(hidden_dim)
+        self.norm_seq = nn.LayerNorm(hidden_dim)
 
         self.ffn = nn.Sequential(
-            nn.LayerNorm(hidden_size),
-            nn.Linear(hidden_size, hidden_size * expansion),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * expansion),
             nn.GELU(),
-            nn.Linear(hidden_size * expansion, hidden_size)
+            nn.Linear(hidden_dim * expansion, hidden_dim)
         )
 
     def forward(self, fwd, lat, bck):
-        # Let the model interpret incoming signals appropriately
-        F = self.F(fwd)
-        L = self.L(lat)
-        B = self.B(bck)
+        batch_size, seq_len, hidden_dim = fwd.shape
 
-        # Normalize incoming signals
-        F = self.norm_fwd(F)
-        L = self.norm_lat(L)
-        B = self.norm_bck(B)
+        # Project and normalize each stream
+        F = self.F(fwd)  # (batch_size, seq_len, hidden_dim)
+        L = self.L(lat)  # (batch_size, seq_len, hidden_dim)
+        B = self.B(bck)  # (batch_size, seq_len, hidden_dim)
 
-        # Process and combine all three directions through the activation
-        attn_out = self.FLB_Attention(F, L, B)
-        attn_out = self.norm_attn(attn_out)
+        ### IM MAKING AN ARCHITECTUAL DECISION HERE THAT *ONLY* THE *LATERAL* TOKEN IS GENERATING THE QUERY BASED ON ITS PREVIOUS STATE ###
 
-        # Apply the feedforward network to the attention output
-        update = self.ffn(L + attn_out)
+        # Flatten batch and sequence so each position is treated as an independent item
+        F_flat = F.view(batch_size * seq_len, 1, hidden_dim)  # Shape: (batch_size * seq_len, 1, hidden_dim)
+        L_flat = L.view(batch_size * seq_len, 1, hidden_dim)  # Shape: (batch_size * seq_len, 1, hidden_dim)
+        B_flat = B.view(batch_size * seq_len, 1, hidden_dim)  # Shape: (batch_size * seq_len, 1, hidden_dim)
 
-        return update
+        # Join the three streams side by side to make keys and values of length 3
+        kv_streams = torch.cat([F_flat, L_flat, B_flat], dim=1)  # Shape: (batch_size * seq_len, 3, hidden_dim)
+
+        ### Because of the scale (3 tokens) it might actually be more efficient to do this dot product math manually here ###
+
+        # Lateral query asks questions of the 3 streams at its own position
+        stream_out, _ = self.stream_attn(query=L_flat, key=kv_streams, value=kv_streams, need_weights=False) # Shape: (batch_size * seq_len, 1, hidden_dim)
+
+        # Restore original sequence shape and add residual connection from L
+        mixed_lat = stream_out.view(batch_size, seq_len, hidden_dim)    # Shape: (batch_size, seq_len, hidden_dim)
+        mixed_lat = self.norm_stream(L + mixed_lat)                     # Shape: (batch_size, seq_len, hidden_dim)
+
+        ### After computing an update for each individual token, we do sequence wise attention ###
+
+        # Run csequence attention across time
+        seq_out, _ = self.seq_attn(query=mixed_lat, key=mixed_lat, value=mixed_lat, is_causal=False, need_weights=False) # Shape: (batch_size, seq_len, hidden_dim)
+
+        # Normalize the sequence attention output
+        seq_out = self.norm_seq(seq_out) # Shape: (batch_size, seq_len, hidden_dim)
+
+        # Apply feedforward network with residual connection
+        update = self.ffn(mixed_lat + seq_out) # Shape: (batch_size, seq_len, hidden_dim)
+
+        return update # Shape: (batch_size, seq_len, hidden_dim)
 
 class Iteration_Model(nn.Module):
-    def __init__(self, vocab_size, hidden_dim, num_heads = 4, sweeps = 1, sweep_iters = 1, num_layers = 6, layer_iters = 1, window_size = 64):
+    def __init__(self, vocab_size, hidden_dim, num_heads = 4, sweep_iters = 1, num_layers = 6, layer_iters = 1, window_size = 64):
         super(Iteration_Model, self).__init__()
         # model parameters
         self.hidden_dim = hidden_dim
@@ -108,16 +79,16 @@ class Iteration_Model(nn.Module):
         # iteration parameters
         self.num_layers = num_layers
         self.layer_iters = layer_iters
-        self.sweeps = sweeps
         self.sweep_iters = sweep_iters
 
+        # Standard deviation calculated from the hidden size to initialize prediction_slots pre-normalized
+        init_scale = 1.0 / (hidden_dim ** 0.5)
+
         # A single learned canvas for future lookahead slots
-        self.prediction_slot = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+        self.prediction_slot = nn.Parameter(torch.randn(1, 1, hidden_dim) * init_scale)
 
         # For initializing new "empty" layers
-        self.new_layer_context = nn.Parameter(
-            torch.randn(num_layers, 1, 1, hidden_dim) * 0.02
-        )
+        self.new_layer_context = nn.Parameter(torch.randn(num_layers, 1, 1, hidden_dim) * init_scale)
         
         # model layers
         self.embedding = nn.Embedding(vocab_size, hidden_dim)
@@ -157,34 +128,29 @@ class Iteration_Model(nn.Module):
         if layers_out is None:
             layers_out = [self.new_layer_context[n].expand(batch_size, total_len, self.hidden_dim) for n in range(self.num_layers)]
 
-        for s in range(self.sweeps): # Go through each Sweep
-            for si in range(self.sweep_iters): # Go through each Sweep Iteration
-                for n in range(self.num_layers): # Go through each layer
-                    # Backward signal from the layer above
-                    if n + 1 < self.num_layers:
-                        back = layers_out[n+1]
-                    else: 
-                        back = torch.zeros_like(x_stream)
-                    # Forward signal from layer below
-                    if(n == 0):
-                        forward = x_stream
-                    else:
-                        forward = layers_out[n-1]
+        for s in range(self.sweep_iters): # Go through each Sweep Iteration
+            for n in range(self.num_layers): # Go through each layer
+                # Backward signal from the layer above
+                if n + 1 < self.num_layers:
+                    back = layers_out[n+1]
+                else: 
+                    back = torch.zeros_like(x_stream)
+                # Forward signal from layer below
+                if(n == 0):
+                    forward = x_stream
+                else:
+                    forward = layers_out[n-1]
+                for l in range(self.layer_iters): # Go through every layer iteration
+                    # Pass in the current forward input, the iterated lateral input, and the current backward input
+                    layers_out[n] = forward + self.layers[n](forward, layers_out[n], back)
+                ### end layer iterations
+            ### end layers
+        ### end sweep iterations
 
-                    for l in range(self.layer_iters): # Go through every layer iteration
-                        # Pass in the current forward input, the iterated lateral input, and the current backward input
-                        layers_out[n] = forward + self.layers[n](forward, layers_out[n], back)
+        # Update the input to the next sweep with the output of the last layer
+        output = layers_out[self.num_layers - 1]
 
-                    ### end layer iterations
-                ### end layers
-            ### end sweep iterations
-
-            # After every sweep update the input to the next sweep with the output of the last layer
-            x_stream = layers_out[self.num_layers - 1]
-
-        ### end sweeps
-
-        return x_stream, layers_out
+        return output, layers_out
 
     def stream_model(self, prompt, layer_context, stride, num_predictions):
         # 1. Forward pass through the window
