@@ -27,7 +27,7 @@ class Layer_Block(nn.Module):
             nn.Linear(hidden_dim * expansion, hidden_dim)
         )
 
-    def forward(self, fwd, lat, bck):
+    def forward(self, fwd, lat, bck, pos_emb=None):
         batch_size, seq_len, hidden_dim = fwd.shape
 
         # Project and normalize each stream
@@ -48,7 +48,7 @@ class Layer_Block(nn.Module):
         ### Because of the scale (3 tokens) it might actually be more efficient to do this dot product math manually here ###
 
         # Lateral query asks questions of the 3 streams at its own position
-        stream_out, _ = self.stream_attn(query=L_flat, key=kv_streams, value=kv_streams, need_weights=False) # Shape: (batch_size * seq_len, 1, hidden_dim)
+        stream_out, _ = self.stream_attn(query=L_flat, key=kv_streams, value=kv_streams, is_causal=False, need_weights=False) # Shape: (batch_size * seq_len, 1, hidden_dim)
 
         # Restore original sequence shape and add residual connection from L
         mixed_lat = stream_out.view(batch_size, seq_len, hidden_dim)    # Shape: (batch_size, seq_len, hidden_dim)
@@ -56,8 +56,20 @@ class Layer_Block(nn.Module):
 
         ### After computing an update for each individual token, we do sequence wise attention ###
 
-        # Run csequence attention across time
-        seq_out, _ = self.seq_attn(query=mixed_lat, key=mixed_lat, value=mixed_lat, is_causal=False, need_weights=False) # Shape: (batch_size, seq_len, hidden_dim)
+        # Inject position into queries and keys to preserve semantic values
+        if pos_emb is not None:
+            q = mixed_lat + pos_emb
+            k = mixed_lat + pos_emb
+        else:
+            q = mixed_lat
+            k = mixed_lat
+        v = mixed_lat
+
+        # Generate causal mask
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=q.device)
+
+        # Run sequence attention across time
+        seq_out, _ = self.seq_attn(query=q, key=k, value=v, attn_mask=causal_mask, is_causal=True, need_weights=False) # Shape: (batch_size, seq_len, hidden_dim)
 
         # Normalize the sequence attention output
         seq_out = self.norm_seq(seq_out) # Shape: (batch_size, seq_len, hidden_dim)
@@ -67,9 +79,9 @@ class Layer_Block(nn.Module):
 
         return update # Shape: (batch_size, seq_len, hidden_dim)
 
-class Iteration_Model(nn.Module):
+class FLB_Model(nn.Module):
     def __init__(self, vocab_size, hidden_dim, num_heads = 4, sweep_iters = 1, num_layers = 6, layer_iters = 1, window_size = 64):
-        super(Iteration_Model, self).__init__()
+        super(FLB_Model, self).__init__()
         # model parameters
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
@@ -84,49 +96,36 @@ class Iteration_Model(nn.Module):
         # Standard deviation calculated from the hidden size to initialize prediction_slots pre-normalized
         init_scale = 1.0 / (hidden_dim ** 0.5)
 
-        # A single learned canvas for future lookahead slots
-        self.prediction_slot = nn.Parameter(torch.randn(1, 1, hidden_dim) * init_scale)
-
         # For initializing new "empty" layers
         self.new_layer_context = nn.Parameter(torch.randn(num_layers, 1, 1, hidden_dim) * init_scale)
         
         # model layers
         self.embedding = nn.Embedding(vocab_size, hidden_dim)
-        self.pos_embedding = nn.Embedding(window_size * 2, hidden_dim) # Cannot predict more future tokens than are in the window
+        self.pos_embedding = nn.Embedding(window_size, hidden_dim) # Cannot predict more future tokens than are in the window
         self.layers = nn.ModuleList([Layer_Block(hidden_dim, expansion=2, num_heads=num_heads) for _ in range(num_layers)])
         self.final_norm = nn.LayerNorm(hidden_dim)
         self.output = nn.Linear(hidden_dim, vocab_size)
 
-    def forward(self, x, layers_out=None, num_predictions=1):
+    def forward(self, x, layers_out=None):
         batch_size, seq_len = x.shape
-        context_emb = self.embedding(x)
+        fwd_stream = self.embedding(x)
 
-        # Attach future query slots if using multi-token prediction
-        if num_predictions > 1:
-            num_slots = num_predictions - 1
-            query_emb = self.prediction_slot.expand(batch_size, num_slots, self.hidden_dim)
-            fwd_stream = torch.cat([context_emb, query_emb], dim=1)
-        else:
-            fwd_stream = context_emb
+        positions = torch.arange(seq_len, device=x.device)
+        pos_emb = self.pos_embedding(positions).unsqueeze(0)  # Shape: (1, seq_len, hidden_dim)
 
-        # Add positional embeddings across the entire n + p sequence
-        total_len = fwd_stream.shape[1]
-        positions = torch.arange(total_len, device=x.device)
-        fwd_stream = fwd_stream + self.pos_embedding(positions)
-
-        x_stream, layers_out = self.run_iterations(fwd_stream, layers_out, num_predictions)
+        x_stream, layers_out = self.run_iterations(fwd_stream, layers_out, pos_emb=pos_emb)
 
         # Normalize and pass final output through prediction head
         x_stream = self.final_norm(x_stream)
         output = self.output(x_stream)
         return output, layers_out
 
-    def run_iterations(self, x_stream, layers_out=None, num_predictions=1):
-        batch_size, total_len, _ = x_stream.shape
+    def run_iterations(self, x_stream, layers_out=None, pos_emb=None):
+        batch_size, seq_len, _ = x_stream.shape
 
         # If no previous memory exists, expand the learned initial states
         if layers_out is None:
-            layers_out = [self.new_layer_context[n].expand(batch_size, total_len, self.hidden_dim) for n in range(self.num_layers)]
+            layers_out = [self.new_layer_context[n].expand(batch_size, seq_len, self.hidden_dim) for n in range(self.num_layers)]
 
         for s in range(self.sweep_iters): # Go through each Sweep Iteration
             for n in range(self.num_layers): # Go through each layer
@@ -142,7 +141,7 @@ class Iteration_Model(nn.Module):
                     forward = layers_out[n-1]
                 for l in range(self.layer_iters): # Go through every layer iteration
                     # Pass in the current forward input, the iterated lateral input, and the current backward input
-                    layers_out[n] = forward + self.layers[n](forward, layers_out[n], back)
+                    layers_out[n] = forward + self.layers[n](forward, layers_out[n], back, pos_emb=pos_emb)
                 ### end layer iterations
             ### end layers
         ### end sweep iterations
@@ -152,122 +151,78 @@ class Iteration_Model(nn.Module):
 
         return output, layers_out
 
-    def stream_model(self, prompt, layer_context, stride, num_predictions):
-        # 1. Forward pass through the window
-        output, layer_context = self.forward(prompt, layer_context, num_predictions)
-
-        # 2. Extract predictions from the tail
-        all_predictions = output[:, -num_predictions:, :]
-        committed_outputs = all_predictions[:, :stride, :]
-        speculative_predictions = all_predictions[:, stride:, :]
-
-        # 3. Slide memory buffers left by stride
+    def stream_model(self, prompt, layer_context, stride):
+        output, layer_context = self(prompt, layer_context)
         next_layer_context = self.shift_memory(layer_context, stride)
+        return output, next_layer_context
 
-        return committed_outputs, all_predictions, next_layer_context
-
-    def train_model(self, sequence, optimizer=None, criterion=None, layer_context=None, stride = 1, num_predictions = 1, prediction_decay=True, min_pred_decay=0.25, accumulate_gradients=False, on_window=None):
-        assert num_predictions >= stride, (
-        f"Predictions ({num_predictions}) must be >= Stride ({stride})."
-        )
-
+    def train_model(self, sequence, optimizer=None, criterion=None, layer_context=None, stride=1, on_window=None):
         batch_size, seq_len = sequence.shape
-        needed_len = self.window_size + num_predictions
+        needed_len = self.window_size + 1
 
         assert seq_len >= needed_len, (
             f"Sequence length ({seq_len}) is too short. "
-            f"Must be at least {needed_len} tokens for window + predictions."
+            f"Must be at least {needed_len} tokens for window + next token target."
         )
 
-        # Initialize memory if starting a new sequence
         if layer_context is None:
-            canvas_len = self.window_size + max(0, num_predictions - 1)
-            layer_context = [self.new_layer_context[n].expand(batch_size, canvas_len, self.hidden_dim) for n in range(self.num_layers)]
+            layer_context = [self.new_layer_context[n].expand(batch_size, self.window_size, self.hidden_dim) for n in range(self.num_layers)]
 
-        # Calculate decay weights across all prediction slots
-        weights = torch.ones(num_predictions, device=sequence.device)
-        num_speculative = num_predictions - stride
-    
-        if prediction_decay and num_speculative > 0:
-            for i in range(num_speculative):
-                decay_factor = 1.0 - (1.0 - min_pred_decay) * (i / max(1, num_speculative - 1))
-                weights[stride + i] = decay_factor
-    
-        slot_weights = weights.unsqueeze(0)
-        weight_sum = weights.sum()
-    
         if criterion is None:
             criterion = nn.CrossEntropyLoss(reduction='none')
-    
-        if optimizer is not None and not accumulate_gradients:
-            optimizer.zero_grad()
-    
+
         total_loss = 0.0
         window_count = 0
 
         # Slide across the sequence
-        for start in range(0, seq_len - needed_len + 1, stride):
+        for start in range(0, seq_len - self.window_size, stride):
+            if optimizer is not None:
+                optimizer.zero_grad()
+
             input = sequence[:, start : start + self.window_size]
-            targets = sequence[:, start + self.window_size : start + needed_len]
+            targets = sequence[:, start + 1 : start + self.window_size + 1]
 
-            # Step through 1 window of the model
-            outputs, predictions, layer_context = self.stream_model(input, layer_context, stride, num_predictions)
+            outputs, layer_context = self.stream_model(input, layer_context, stride)
 
-            # Calculate token loss across all prediction slots
             raw_loss = criterion(
-                predictions.reshape(-1, self.vocab_size),
+                outputs.reshape(-1, self.vocab_size),
                 targets.reshape(-1)
             ).reshape(batch_size, -1)
 
-            # Weigh loss based on decay rate
-            step_loss = (raw_loss * slot_weights).sum() / (batch_size * weight_sum)
-
-            # Backpropagation (doesnt update parameters yet)
+            step_loss = raw_loss.mean()
             step_loss.backward()
 
-            # Execute the diagnostic callback if provided
             if on_window is not None:
                 on_window({
+                    'model': self,
                     'window_idx': window_count,
                     'step_loss': step_loss.item(),
                     'input': input,
                     'outputs': outputs,
-                    'predictions': predictions,
+                    'predictions': outputs,
                     'targets': targets,
                     'raw_loss': raw_loss.detach()
                 })
 
-            # Update parameters if not accumulating them
-            if not accumulate_gradients and optimizer is not None:
+            if optimizer is not None:
                 torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
                 optimizer.step()
-                optimizer.zero_grad()
 
             total_loss += step_loss.item()
             window_count += 1
-
-        # Final step update if accumulating across the sequence
-        if accumulate_gradients and optimizer is not None and window_count > 0:
-            for param in self.parameters():
-                if param.grad is not None:
-                    param.grad.data.div_(window_count)
-            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad()
 
         avg_loss = total_loss / max(1, window_count)
         return avg_loss, layer_context
     
     @torch.no_grad()
-    def generate(self, prompt, num_tokens, temperature=0.8, stride=1, num_predictions=1, layer_context=None, on_step=None):
+    def generate(self, prompt, num_tokens, temperature=0.8, layer_context=None, on_step=None):
         self.eval()
         batch_size = prompt.shape[0]
         tokens = prompt.clone()
         generated_count = 0
 
-        # Initialize recurrent memory if starting fresh
         if layer_context is None:
-            layer_context = [self.new_layer_context[n].expand(batch_size, self.window_size + max(0, num_predictions - 1), self.hidden_dim) for n in range(self.num_layers)]
+            layer_context = [self.new_layer_context[n].expand(batch_size, self.window_size, self.hidden_dim) for n in range(self.num_layers)]
 
         while generated_count < num_tokens:
             if tokens.shape[1] < self.window_size:
@@ -277,23 +232,19 @@ class Iteration_Model(nn.Module):
             else:
                 input = tokens[:, -self.window_size:]
 
-            outputs, predictions, layer_context = self.stream_model(input, layer_context, stride, num_predictions)
+            outputs, layer_context = self.stream_model(input, layer_context, stride=1)
 
-            # Sample the output based on temperature
-            probs = torch.softmax(outputs / temperature, dim=-1)
-            sampled = torch.multinomial(probs.reshape(-1, self.vocab_size), num_samples=1).reshape(batch_size, stride)
+            last_logits = outputs[:, -1, :]
+            probs = torch.softmax(last_logits / temperature, dim=-1)
+            sampled = torch.multinomial(probs, num_samples=1)
 
             tokens = torch.cat([tokens, sampled], dim=1)
-            generated_count += stride
+            generated_count += 1
 
             if on_step is not None:
-                # Take the highest-probability character across every lookahead slot
-                lookahead_tokens = torch.argmax(predictions, dim=-1)
-
                 on_step({
                     'new_tokens': sampled,
                     'tokens_so_far': tokens,
-                    'lookahead_tokens': lookahead_tokens,
                     'count': generated_count
                 })
 

@@ -1,0 +1,20 @@
+# Bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Future large datasets
+data/
+
+# Jupyter checkpoint files
+.ipynb_checkpoints/
+
+# Environment and local configs
+.env
+venv/
+.venv/
+env/
+
+# Operating system files
+.DS_Store
+Thumbs.db
