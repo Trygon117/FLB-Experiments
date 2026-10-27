@@ -1,5 +1,157 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as tF
+import math
+
+class FLBLayer(nn.Module):
+    def __init__(self, hidden_dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        assert self.head_dim * num_heads == hidden_dim, "hidden_dim must be divisible by num_heads"
+
+        # Input Stream Projections & Norms (F, L, B)
+        self.proj_F = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim))
+        self.proj_L = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim))
+        self.proj_B = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim))
+
+        # Manual 3x3 Cross-Stream Attention Projections (Matches FLB-Attention)
+        self.W_q_stream = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.W_k_stream = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.W_v_stream = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.W_o_stream = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.norm_stream = nn.LayerNorm(hidden_dim)
+
+        # Sequence-Wise Causal Attention (Operates on the Lateral working memory)
+        self.seq_attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm_seq = nn.LayerNorm(hidden_dim)
+
+        # Feedforward Network (Aligns representations as shown in TransformerFAM Appendix C.1)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, 4 * hidden_dim),
+            nn.GELU(),
+            nn.Linear(4 * hidden_dim, hidden_dim),
+            nn.Dropout(dropout)
+        )
+        self.norm_ffn = nn.LayerNorm(hidden_dim)
+
+        # Lightweight JEPA Reverse-Predictors for the Auxiliary Loss
+        # Predicts detached inputs from the new Lateral state Z_L (+ complementary context)
+        self.pred_F = nn.Linear(hidden_dim * 2, hidden_dim) # Uses [Z_L, sg(B)] -> sg(F)
+        self.pred_B = nn.Linear(hidden_dim * 2, hidden_dim) # Uses [Z_L, sg(F)] -> sg(B)
+        self.pred_L = nn.Linear(hidden_dim * 3, hidden_dim) # Uses [Z_L, sg(F), sg(B)] -> sg(L_prev)
+
+    def forward(self, fwd, lat, bck, pos_emb=None, calc_aux=False):
+        # Bottom-Up Sequence Context (Causal Attention across tokens 1..t)
+        F_seq = self._bottom_up_attention(fwd, pos_emb)
+
+        # Might be unnecessary since we are routing unique streams now
+        F_in = self.proj_F(F_seq)
+        L_in = self.proj_L(lat)
+        B_in = self.proj_B(bck)
+
+        # 3x3 Cross-Stream FLB Attention
+        mixed_F, mixed_L, mixed_B  = self._mix_streams(F_in, L_in, B_in)
+
+        # Calculate the final outputs for each stream
+        Z_F = self._treat_F(F_seq, mixed_F)
+        Z_L = self._treat_L(L_in, mixed_L, lat)
+        Z_B = self._treat_B(B_in, mixed_B)
+
+        # Optionally, calculate the auxiliary loss for the model that approximates detached error signals
+        if(calc_aux):
+            aux_loss = self._calculate_auxiliary_loss()
+        else:
+            aux_loss = None
+
+        return Z_F, Z_L, Z_B, aux_loss
+
+    def _bottom_up_attention(self, fwd, pos_emb):
+        """
+        Bottom-Up Sequence Context (Causal Attention across tokens 1..t)
+        Ensures the Forward stream knows about every token in the sequence so far
+        """
+        B_sz, S_len, D = fwd.shape
+
+        F_norm = self.norm_F_in(fwd)
+        q_seq = F_norm + pos_emb if pos_emb is not None else F_norm
+        k_seq = F_norm + pos_emb if pos_emb is not None else F_norm
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(S_len, device=fwd.device)
+
+        seq_out, _ = self.seq_attn(q_seq, k_seq, F_norm, attn_mask=causal_mask, is_causal=True, need_weights=False)
+        F_seq = self.norm_seq(fwd + seq_out) # Bottom-up stream now holds sequence-wide context
+
+        return F_seq
+
+    def _mix_streams(self, F_in, L_in, B_in):
+        """
+        3x3 Cross-Stream FLB Attention ("Putting the picture together")
+        Non-causal mixing of [F_seq, L_in, B_in] at each token position
+        """
+        B_sz, S_len, D = F_in.shape
+        H, D_h = self.num_heads, self.head_dim
+
+        # Stack into 3 tokens per sequence position: (B_sz, S_len, 3, D)
+        streams = torch.stack([F_in, L_in, B_in], dim=2)
+
+        q = self.W_q_stream(streams).view(B_sz, S_len, 3, H, D_h).transpose(1, 3)
+        k = self.W_k_stream(streams).view(B_sz, S_len, 3, H, D_h).transpose(1, 3)
+        v = self.W_v_stream(streams).view(B_sz, S_len, 3, H, D_h).transpose(1, 3)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D_h)
+        stream_out = torch.matmul(tF.softmax(scores, dim=-1), v)
+        stream_out = self.W_o_stream(stream_out.transpose(1, 3).contiguous().view(B_sz, S_len, 3, D))
+
+        mixed_F = stream_out[:, :, 0, :]
+        mixed_L = stream_out[:, :, 1, :]
+        mixed_B = stream_out[:, :, 2, :]
+
+        return mixed_F, mixed_L, mixed_B
+
+    def _treat_F(self, F_seq, mixed_F):
+        """
+        # Z_F: Sequence-aware bottom-up representation refined by L & B -> goes UP to Layer n+1
+        """
+        Z_F = self.norm_F_out(F_seq + mixed_F)
+        Z_F = self.norm_ffn_F(Z_F + self.ffn_F(Z_F))
+        return Z_F
+
+    def _treat_L(self, L_in, mixed_L, prev_L):
+        """
+        Z_L: Gated Lateral Working Memory -> stays at Layer n for next step
+        """
+        candidate_L = self.norm_L_out(L_in + mixed_L)
+        candidate_L = self.norm_ffn_L(candidate_L + self.ffn_L(candidate_L))
+
+        # Convex GRU-style gate interpolates between previous thought (lat) and new synthesis (tilde_L)
+        gate_L = torch.sigmoid(self.update_gate_L(torch.cat([lat, candidate_L], dim=-1)))
+        Z_L = gate_L * prev_L + (1.0 - gate_L) * candidate_L
+
+        return Z_L
+
+    def _treat_B(self, Z_L, F_seq, mixed_B):
+        """
+        Z_B: Inter-Layer Delta -> goes DOWN to Layer n-1
+        Encodes what changed at this layer (Z_L - F_seq) + top-down context (tilde_B)
+        """
+        layer_delta = Z_L - F_seq
+        Z_B = self.norm_B_out(mixed_B + self.ffn_B(layer_delta))
+        return Z_B
+
+    def _calculate_auxiliary_loss(self, F_seq, L_in, B_in, Z_L):
+        """
+        Local Auxiliary Loss (Preserving history in Z_L)
+        Forces Z_L to retain the ability to reconstruct the generating signals
+        """
+        # Detach error signals
+        t_F, t_L, t_B = F_seq.detach(), L_in.detach(), B_in.detach()
+        loss_F = 1.0 - tF.cosine_similarity(self.pred_F(torch.cat([Z_L, t_B], dim=-1)), t_F, dim=-1).mean()
+        loss_B = 1.0 - tF.cosine_similarity(self.pred_B(torch.cat([Z_L, t_F], dim=-1)), t_B, dim=-1).mean()
+        loss_L = 1.0 - tF.cosine_similarity(self.pred_L(torch.cat([Z_L, t_F, t_B], dim=-1)), t_L, dim=-1).mean()
+        aux_loss = loss_F + loss_B + loss_L
+        return aux_loss
+
 
 class Layer_Block(nn.Module):
     def __init__(self, hidden_dim, expansion=2, num_heads=4):
@@ -271,3 +423,6 @@ class FLB_Model(nn.Module):
             shifted.append(new_state.detach())
 
         return shifted
+
+    def get_empty_layer_context(self, batch_size):
+        return [self.new_layer_context[n].expand(batch_size, self.window_size, self.hidden_dim) for n in range(self.num_layers)]
